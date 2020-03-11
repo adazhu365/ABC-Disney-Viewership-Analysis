@@ -1,0 +1,417 @@
+---
+title: "Disney_CaseStudy"
+author: "Ada Zhu"
+date: "3/2/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+<!--- Load Required R packages here --->
+```{r, message=FALSE}
+library(DBI)
+library(RSQLite)
+library(ggplot2)
+library(glmnet)
+library(dplyr)
+library(caret)
+library(randomForest)
+library(DMwR)
+library(pROC)
+```
+<!--- Connect to Database --->
+```{r}
+sqlite <- dbDriver("SQLite")
+con <- dbConnect(sqlite, "sample.db")
+```
+
+# Task 1 - How many telecats does each series have?
+```{r}
+sql_1 <- "select series_name, count(telecast_id) as telecast_count from telecast group by series_name"
+res_1 <- dbSendQuery(con, sql_1)
+df_1 <- dbFetch(res_1)
+print(df_1)
+```
+
+# Task 2 - How many unique households does each series have by month of program start? 
+```{r}
+sql_2 <- "select count(distinct household_id) as household_count, a.series_name
+        from tunein 
+        inner join (select telecast_id, series_name, strftime('%Y %m', program_start_local) as start_month 
+                    from telecast
+                    where (series_name, start_month) in (select series_name, min(strftime('%Y %m', program_start_local)) as start_month 
+                                                        from telecast 
+                                                        group by series_name
+        )
+        ) a
+on strftime('%Y %m', start_event_timestamp_local) = start_month and tunein.telecast_id = a.telecast_id
+group by series_name"
+
+res_2 <- dbSendQuery(con, sql_2)
+df_2 <- dbFetch(res_2)
+print(df_2)
+```
+
+# Task 3 - Which series has the most live watches?
+```{r}
+sql_3 <- "select series_name, count(distinct household_id) as household_count
+        from (select household_id, sum(event_length_seconds)/60 as min, count(household_id) as count, telecast_id, series_name
+              from (select household_id, telecast_id, event_length_seconds, series_name
+                    from tunein
+                    join telecast
+                    using(telecast_id)
+              where dvr_time_shift == 'L')
+        group by telecast_id, household_id, series_name
+        having count > 1 and min >6 )
+group by series_name
+order by household_count desc
+limit 1"
+res_3 <- dbSendQuery(con, sql_3)
+df_3 <- dbFetch(res_3)
+print(df_3)
+```
+
+# Task 4 - What is the top live watched telecast per series for ABC programs?
+```{r}
+#1) Select all ABC programs by joining tunein and telecast
+#2) Find all record that are qualified as 'live watch' 
+#3) Find count of household per telecast -> grab telecast with max count
+
+sql_4 <-" select telecast_id, series_name 
+        from(
+            select count(household_id) as household_count, telecast_id, series_name
+            from(
+                  select household_id, sum(event_length_seconds)/60 as min, count(household_id) as count, telecast_id, series_name 
+                  from(
+                        select household_id, telecast_id, event_length_seconds, series_name
+                        from tunein
+                        join telecast
+                        using(telecast_id)
+                        where dvr_time_shift == 'L' and network_id = (select network_id from affiliates where network_name = 'ABC') 
+                        )
+                  group by telecast_id, household_id, series_name
+                  having count > 1 and min >6 
+                  )
+            group by series_name, telecast_id
+        )
+        where (household_count, series_name) in(
+
+                            select max(household_count), series_name
+                            from(
+                                  select count(household_id) as household_count, telecast_id, series_name
+                                  from(
+                                          select household_id, sum(event_length_seconds)/60 as min, count(household_id) as count, telecast_id, series_name 
+                                                from(
+                                                    select household_id, telecast_id, event_length_seconds, series_name
+                                                    from tunein
+                                                    join telecast
+                                                    using(telecast_id)
+                                                    where dvr_time_shift == 'L' and network_id = (select network_id from affiliates where network_name = 'ABC') 
+                                                    )
+                                          group by telecast_id, household_id, series_name
+                                          having count > 1 and min >6 )
+                                  group by series_name, telecast_id
+                                  )
+                            group by series_name
+                         )"
+
+res_4 <- dbSendQuery(con, sql_4)
+df_4 <- dbFetch(res_4)
+print(df_4)
+```
+
+
+# For Task 5, 6 and 7, create temporary table 'individual_data' and 'abc_individual_data'
+```{r}
+#Create temp table & replace with network, timezone, telecast info
+sql_tbl1 <- "select distinct household_id, telecast_id, dvr_time_shift, start_event_timestamp_local, event_length_seconds, 
+        network_name, series_name, episode_name, program_start_local, timezone
+        from tunein left join affiliates using (network_id) left join telecast using (telecast_id) left join timezones using(timezone_id)"
+
+res <- dbSendQuery(con, sql_tbl1)
+indiv <- dbFetch(res)
+dbWriteTable(con, "individual_data", indiv,temporary = TRUE, overwrite = TRUE)
+
+sql <- "select * from individual_data limit 10"
+res <- dbSendQuery(con, sql)
+df_tbl1 <- dbFetch(res)
+print(df_tbl1)
+```
+
+```{r}
+sql_tbl2 <- "select *, strftime('%Y %m %d', start_event_timestamp_local) as watch_date, strftime('%H', start_event_timestamp_local) as watch_start_time, strftime('%Y %m %d', program_start_local) as start_date from individual_data where network_name = 'ABC'"
+res <- dbSendQuery(con, sql_tbl2)
+abc_indiv <- dbFetch(res)
+dbWriteTable(con, "abc_individual_data", abc_indiv,temporary = TRUE, overwrite = TRUE)
+
+sql <- "select * from abc_individual_data limit 10"
+res <- dbSendQuery(con, sql)
+df_tbl2 <- dbFetch(res)
+print(df_tbl2)
+```
+
+# Task 5 - Summarize the viewership of each network. Explain why you chose the approach and metrics.
+
+```{r}
+#total network visits over two months
+sql <-"select network_name, count(network_name) as total_visit, sum(event_length_seconds)/3600 as duration_hr from individual_data group by network_name order by total_visit desc"
+res <- dbSendQuery(con, sql)
+total_visit <- dbFetch(res)
+print(total_visit)
+```
+```{r}
+
+```
+
+```{r}
+#average duration per visit
+sql <- "select sum(event_length_seconds) *1.0 / (count(household_id) * 60 ) as avg_min, network_name from individual_data group by network_name"
+res <- dbSendQuery(con, sql)
+duration_df <- dbFetch(res)
+print(duration_df)
+
+#However, on further inspection, the average minutes spent per visit of each network only differ by 1.5 minutes, which doesn't seem to be a significant difference. Every visit seem to spend around the same amount of time. The total time spent on the network seems to be more of the total visit of each network. 
+```
+
+```{r}
+#total network visit per month
+sql <-"select count(network_name) as visit_num, count(distinct series_name) as series_count,  network_name, strftime('%Y %m', start_event_timestamp_local) as month 
+from individual_data 
+group by network_name, month"
+res <- dbSendQuery(con, sql)
+series_df <- dbFetch(res)
+print(series_df)
+
+write.csv(series_df,"series.csv", row.names = FALSE)
+
+#hence verified by the data that the increase in october can be attributed to the increase in the series
+```
+
+
+```{r}
+ggplot(visit_df, aes(fill=network_name, y=visit_num, x=month)) + 
+  geom_bar(position="dodge", stat="identity")
+```
+
+```{r}
+#increase since last month
+visit_df =  visit_df %>% group_by(network_name) %>%
+  mutate(growth_percentage = (visit_num - lag(visit_num))/lag(visit_num) * 100)  
+
+visit_df
+
+#while fox has the overall least viewers, it has the highest percentage increase in viewers from sep to oct. 
+```
+
+
+```{r}
+#num of household of each network
+sql <- "select count(distinct household_id) as household_count, count(network_name) as total_visit, (count(network_name) *1.0 / count(distinct household_id)) as visit_per_household, network_name from individual_data group by network_name order by visit_per_household desc"
+res <- dbSendQuery(con, sql)
+household_df <- dbFetch(res)
+print(household_df)
+
+#given the small difference in household count across networks, it seems like NBC and CBS get more visit per household, this is further
+#proved by the visit per household measures below. 
+```
+
+
+# Task 6 -Describe the ABC household.
+```{r}
+# percentage of household per series
+sql <- "select series_name, count(distinct household_id) as household_count
+        from(select household_id, sum(event_length_seconds)/60 as min, count(household_id) as count, telecast_id, watch_start_time, series_name
+              from abc_individual_data
+              group by telecast_id, household_id, watch_start_time, series_name
+                      having count > 1 and min >6)
+group by series_name
+order by household_count desc"
+
+res <- dbSendQuery(con, sql)
+household_percentage <- dbFetch(res)
+
+household_percentage %>% mutate(household_percentage = (household_count *1.0 / sum(household_percentage$household_count) )*100)
+print(household_percentage)
+
+```
+
+```{r}
+#program start date viewership
+sql <- "select series_name, count(distinct household_id) as premiere_household_count
+        from(select household_id, sum(event_length_seconds)/60 as min, count(household_id) as count, telecast_id, series_name
+              from (select * 
+                    from abc_individual_data 
+                    where dvr_time_shift == 'L' and watch_date ==start_date)
+        group by telecast_id, household_id, series_name
+                      having count > 1 and min >6)
+group by series_name
+order by household_count desc"
+
+res <- dbSendQuery(con, sql)
+start_month_viewership <- dbFetch(res)
+print(start_month_viewership)
+```
+
+
+```{r}
+#L v.s L+SD
+sql <- "select count(household_id) , live_count
+from (select count(distinct dvr_time_shift) as live_count, household_id from abc_individual_data group by dvr_time_shift, household_id)
+group by live_count"
+res <- dbSendQuery(con, sql)
+df_tz <- dbFetch(res)
+print(df_tz)
+```
+
+```{r}
+#most watched time
+sql <- "select watch_start_time, count(distinct household_id) as household_count
+        from(select household_id, sum(event_length_seconds)/60 as min, count(household_id) as count, telecast_id, watch_start_time
+              from abc_individual_data 
+              group by telecast_id, household_id, watch_start_time
+                      having count > 1 and min >6)
+group by watch_start_time
+order by household_count desc"
+
+res <- dbSendQuery(con, sql)
+watchtime_df <- dbFetch(res)
+print(watchtime_df)
+
+#prime time
+```
+
+```{r}
+#avg series per household 
+sql <- "select sum(series_count) *1.0 / count(household_id)
+from (select count(distinct series_name) as series_count, household_id from abc_individual_data group by household_id)"
+res <- dbSendQuery(con, sql)
+avg_series <- dbFetch(res)
+print(avg_series)
+```
+
+```{r}
+#avg episode per household 
+sql <- "select sum(episode_count) *1.0 / count(household_id)
+from (select count(distinct episode_name) as episode_count, household_id from abc_individual_data group by household_id)"
+res <- dbSendQuery(con, sql)
+avg_episode <- dbFetch(res)
+print(avg_episode)
+```
+
+```{r}
+#total time per household 
+sql <- "select sum(event_length_seconds) /60 as total_min, household_id from abc_individual_data group by household_id"
+res <- dbSendQuery(con, sql)
+household_time <- dbFetch(res)
+
+sum(household_time$total_min) / nrow(household_time)
+print(household_time)
+```
+
+
+
+# Task 7 - Construct a model to predict whether a household will live watch the foruth episode of A Million Little Things.
+```{r}
+#Feature Engineering - consider the following variables for modeling
+#1) program start time
+#2) num of previous episodes watched
+#3) total amount of time spent on watching prev episodes of this series 
+#4) binary column: 1 for live-watch, 0 for no live-watch
+#5) event length in minutes
+
+sql <- "select *, strftime('%H', program_start_local) as program_start_oclock from abc_individual_data"
+res <- dbSendQuery(con, sql)
+predict_df <- dbFetch(res)
+
+predict_df1 = predict_df %>% arrange(household_id, series_name, start_event_timestamp_local)%>% 
+  group_by(household_id, series_name)  %>% 
+  mutate(prev_ep_watched=ifelse(series_name == 'A Million Little Things', cumsum(!duplicated(episode_name)), 0) )%>%
+  mutate(prev_watched_minutes = ifelse(series_name == 'A Million Little Things', cumsum(event_length_seconds) / 60, 0))%>%
+  mutate(live_watch = ifelse(episode_name == 'friday night dinner' & dvr_time_shift == 'L', 1, 0)) %>%
+  mutate(event_min = event_length_seconds/60 )
+
+head(predict_df1)
+# *same household_id watching different episodes at the same time
+```
+
+```{r}
+#among people that have never watched any AMillionLittleThings before, 0 of them watch the 4th episode
+predict_df1[which(predict_df1$live_watch ==1 & predict_df1$prev_ep_watched ==0),] #0
+nrow(predict_df1[which(predict_df1$live_watch ==1 & predict_df1$prev_ep_watched ==1),])#1028
+nrow(predict_df1[which(predict_df1$live_watch ==1 & predict_df1$prev_ep_watched ==2),])#1103
+nrow(predict_df1[which(predict_df1$live_watch ==1 & predict_df1$prev_ep_watched ==3),])#839
+nrow(predict_df1[which(predict_df1$live_watch ==1 & predict_df1$prev_ep_watched ==4),])#749
+```
+
+```{r}
+#extract important variables for modeling
+predict_df2 = predict_df1 %>% ungroup()%>%
+  select(event_min, program_start_oclock, prev_ep_watched, prev_watched_minutes, timezone, live_watch)
+
+#stratified train_test split
+train.index <- createDataPartition(predict_df2$live_watch, p = .8, list = FALSE)
+train <- predict_df2[ train.index,]
+test  <- predict_df2[-train.index,]
+xtest = test[, 1:5]
+table(train$live_watch)
+nrow(train[which(train$live_watch == 1),]) / nrow(train)#1: 0.00429727 -- unbalanced
+```
+
+```{r}
+#Upsampling to include more cases when people do watch the 4th episode
+train$program_start_oclock <- as.factor(train$program_start_oclock)
+train$timezone <- as.factor(train$timezone)
+train$live_watch <- as.factor(train$live_watch)
+
+test$program_start_oclock <- as.factor(test$program_start_oclock)
+test$timezone <- as.factor(test$timezone)
+test$live_watch <- as.factor(test$live_watch)
+
+smote_train <- SMOTE(live_watch ~ ., data  = as.data.frame(train))                         
+table(smote_train$live_watch) 
+```
+
+```{r}
+#RIDGE LOGISTIC REGRESSION
+x1 = smote_train[, c('event_min', 'program_start_oclock', 'prev_ep_watched', 'prev_watched_minutes', 'timezone')]
+x = model.matrix(~., x1)
+y = smote_train$live_watch
+x2 = test[, c('event_min','program_start_oclock', 'prev_ep_watched', 'prev_watched_minutes', 'timezone')]
+xtest = model.matrix(~., x2)
+ytest = test$live_watch
+
+lambdas <- 10^seq(3, -2, by = -.1)
+cv_fit <- cv.glmnet(x, y, alpha = 0, lambda = lambdas, family = 'binomial')
+opt_lambda <- cv_fit$lambda.min
+fit <- cv_fit$glmnet.fit
+
+fit1 <- glmnet(x, y, alpha = 0, lambda = 0.1, family = 'binomial')
+
+
+y_predicted <- predict(fit, s = opt_lambda, newx = xtest, type = "class")
+y_predicted <- ifelse(y_predicted > 0.5,1,0) 
+table(y_predicted)
+
+xtab = table(y_predicted, ytest)
+print(confusionMatrix(xtab)) #Balanced Accuracy : 0.9836      
+
+fit1$beta
+```
+
+```{r}
+#RANDOM FOREST
+model1 <- randomForest(live_watch ~ ., ntree = 4, data = smote_train, importance = TRUE)
+importance(model1) #vif
+y_predicted <- predict(model1, test)
+table(y_predicted)
+
+xtab = table(y_predicted, test$live_watch)
+print(confusionMatrix(xtab)) #      Balanced Accuracy : 0.9827          
+```
+
+#Disconnect
+```{r}
+dbDisconnect(con)
+```
+Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
